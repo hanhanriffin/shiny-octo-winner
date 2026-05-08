@@ -69,7 +69,10 @@
     <div class="progress-copy">
       <div class="progress-copy-top">
         <strong data-progress-title>Uploading files...</strong>
-        <span class="progress-percent" data-progress-percent>0%</span>
+        <span style="display:flex;gap:0.75rem;align-items:center">
+          <span class="progress-percent" data-progress-percent>0%</span>
+          <span class="muted" data-upload-elapsed style="font-size:0.85em"></span>
+        </span>
       </div>
       <p class="muted" data-progress-detail>Reading the workbooks and preparing the dataset.</p>
     </div>

@@ -12,6 +12,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 import polars as pl
@@ -675,19 +676,17 @@ def _read_dataframe(path: str) -> pl.DataFrame:
     if low.endswith(".csv"):
         return pl.read_csv(path, infer_schema_length=1000)
     if low.endswith(".xlsx"):
-        if pd is None:
-            raise RuntimeError("Excel upload requires pandas + openpyxl")
-        pdf = pd.read_excel(path, engine="openpyxl")  # type: ignore
-        return pl.from_pandas(pdf)
+        return pl.read_excel(path)
     raise RuntimeError("Unsupported file type (use .csv or .xlsx)")
 
 
 def _read_excel_object_dataframe(path: str) -> "pd.DataFrame":
     if pd is None:
         raise RuntimeError("Excel mapping requires pandas + openpyxl")
-    return pd.read_excel(path, engine="openpyxl", dtype=object)  # type: ignore[no-any-return]
+    return pd.read_excel(path, engine="calamine", dtype=object)  # type: ignore[no-any-return]
 
 
+@lru_cache(maxsize=4096)
 def _normalize_response_value(value: Any) -> Optional[str]:
     if value is None:
         return None
@@ -754,17 +753,21 @@ def _normalize_codebook_header(value: Any) -> str:
 def _read_excel_sheets_object_frames(path: str) -> Dict[str, "pd.DataFrame"]:
     if pd is None:
         raise RuntimeError("Excel mapping requires pandas + openpyxl")
-    with pd.ExcelFile(path, engine="openpyxl") as workbook:
+    with pd.ExcelFile(path, engine="calamine") as workbook:
         return {sheet: workbook.parse(sheet, dtype=object) for sheet in workbook.sheet_names}
 
 
-def _extract_codebook_frame(value_path: str) -> Optional["pd.DataFrame"]:
-    for _, frame in _read_excel_sheets_object_frames(value_path).items():
+def _extract_codebook_frame_from_sheets(sheets: Dict[str, "pd.DataFrame"]) -> Optional["pd.DataFrame"]:
+    for _, frame in sheets.items():
         renamed = {column: _normalize_codebook_header(column) for column in frame.columns}
         canonical = frame.rename(columns=renamed)
         if CODEBOOK_REQUIRED_COLUMNS.issubset(set(canonical.columns)):
             return canonical.loc[:, ["question", "code", "label", "order"]].copy()
     return None
+
+
+def _extract_codebook_frame(value_path: str) -> Optional["pd.DataFrame"]:
+    return _extract_codebook_frame_from_sheets(_read_excel_sheets_object_frames(value_path))
 
 
 def _build_question_mappings_from_codebook(codebook_df: "pd.DataFrame") -> MappingBundle:
@@ -1095,7 +1098,12 @@ def _build_question_mappings(text_df: "pd.DataFrame", value_df: "pd.DataFrame") 
         question = str(column)
         categories: List[OrderedCategory] = []
         by_code: Dict[str, OrderedCategory] = {}
+        seen_raw_pairs: set = set()
         for raw_value, text_value in zip(value_df[column].tolist(), text_df[column].tolist()):
+            raw_pair = (raw_value, text_value)
+            if raw_pair in seen_raw_pairs:
+                continue
+            seen_raw_pairs.add(raw_pair)
             code = _normalize_response_value(raw_value)
             if code is None:
                 continue
@@ -1122,44 +1130,34 @@ def _build_question_mappings(text_df: "pd.DataFrame", value_df: "pd.DataFrame") 
 
 
 def _numeric_like_ratio(df: "pd.DataFrame", sample_limit: int = 4000) -> float:
-    seen = 0
-    numeric_like = 0
-    for column in df.columns:
-        for value in df[column].tolist():
-            if value is None or (pd is not None and pd.isna(value)):
-                continue
-            text = str(value).strip()
-            if not text:
-                continue
-            seen += 1
-            lowered = text.casefold()
-            if isinstance(value, (int, float, bool)) or re.fullmatch(r"[+-]?\d+(?:\.\d+)?", text):
-                numeric_like += 1
-            elif lowered in ({"0", "1"} | YES_WORDS | NO_WORDS):
-                numeric_like += 1
-            if seen >= sample_limit:
-                return numeric_like / seen
-    return (numeric_like / seen) if seen else 0.0
+    all_vals = pd.concat([df[c].reset_index(drop=True) for c in df.columns], ignore_index=True).dropna()
+    str_s = all_vals.astype(str).str.strip()
+    all_vals = all_vals[str_s != ""]
+    str_s = str_s[str_s != ""]
+    if all_vals.empty:
+        return 0.0
+    sample_vals = all_vals.iloc[:sample_limit]
+    sample_str = str_s.iloc[:sample_limit]
+    is_numeric = pd.to_numeric(sample_vals, errors="coerce").notna()
+    is_yes_no = sample_str.str.casefold().isin({"0", "1"} | YES_WORDS | NO_WORDS)
+    return float((is_numeric | is_yes_no).sum()) / float(len(sample_vals))
 
 
 def _label_like_ratio(df: "pd.DataFrame", sample_limit: int = 4000) -> float:
-    seen = 0
-    label_like = 0
-    for column in df.columns:
-        for value in df[column].tolist():
-            if value is None or (pd is not None and pd.isna(value)):
-                continue
-            text = str(value).strip()
-            if not text:
-                continue
-            seen += 1
-            lowered = text.casefold()
-            if not re.fullmatch(r"[+-]?\d+(?:\.\d+)?", text) and lowered not in ({"0", "1"} | YES_WORDS | NO_WORDS):
-                if len(text) >= 6 or bool(re.search(r"\s", text)):
-                    label_like += 1
-            if seen >= sample_limit:
-                return label_like / seen
-    return (label_like / seen) if seen else 0.0
+    all_vals = pd.concat([df[c].reset_index(drop=True) for c in df.columns], ignore_index=True).dropna()
+    str_s = all_vals.astype(str).str.strip()
+    all_vals = all_vals[str_s != ""]
+    str_s = str_s[str_s != ""]
+    if str_s.empty:
+        return 0.0
+    sample_vals = all_vals.iloc[:sample_limit]
+    sample_str = str_s.iloc[:sample_limit]
+    is_numeric = pd.to_numeric(sample_vals, errors="coerce").notna()
+    is_yes_no = sample_str.str.casefold().isin({"0", "1"} | YES_WORDS | NO_WORDS)
+    is_long = sample_str.str.len() >= 6
+    has_space = sample_str.str.contains(r"\s", regex=True, na=False)
+    is_label = ~is_numeric & ~is_yes_no & (is_long | has_space)
+    return float(is_label.sum()) / float(len(sample_str))
 
 
 def _orientation_confidence(text_df: "pd.DataFrame", value_df: "pd.DataFrame") -> float:
@@ -1170,13 +1168,19 @@ def _orientation_confidence(text_df: "pd.DataFrame", value_df: "pd.DataFrame") -
     return (value_numeric - text_numeric) + (text_label_like - value_label_like)
 
 
-def _load_mapping_bundle(text_path: str, value_path: str) -> MappingBundle:
-    codebook_df = _extract_codebook_frame(value_path)
+def _load_mapping_bundle(
+    text_path: str,
+    value_path: str,
+    _preread_text_df: Optional["pd.DataFrame"] = None,
+    _preread_value_sheets: Optional[Dict[str, "pd.DataFrame"]] = None,
+) -> MappingBundle:
+    value_sheets = _preread_value_sheets if _preread_value_sheets is not None else _read_excel_sheets_object_frames(value_path)
+    codebook_df = _extract_codebook_frame_from_sheets(value_sheets)
     if codebook_df is not None:
         bundle = _build_question_mappings_from_codebook(codebook_df)
     else:
-        text_df = _read_excel_object_dataframe(text_path)
-        value_df = _read_excel_object_dataframe(value_path)
+        text_df = _preread_text_df if _preread_text_df is not None else _read_excel_object_dataframe(text_path)
+        value_df = next(iter(value_sheets.values()))
         bundle = _build_question_mappings(text_df, value_df)
     bundle.value_path = value_path
     bundle.text_path = text_path
@@ -1197,7 +1201,7 @@ def _resolve_uploaded_workbook_roles(
     file_name_a: str,
     file_path_b: str,
     file_name_b: str,
-) -> Tuple[str, str, MappingBundle]:
+) -> Tuple[str, str, MappingBundle, "pd.DataFrame"]:
     candidates: List[Tuple[str, str]] = []
     a_is_value = _looks_like_value_workbook(file_name_a)
     b_is_value = _looks_like_value_workbook(file_name_b)
@@ -1210,30 +1214,48 @@ def _resolve_uploaded_workbook_roles(
         candidates.append((file_path_a, file_path_b))
         candidates.append((file_path_b, file_path_a))
 
+    # Cache reads so each file is opened at most once across all candidate pairs
+    _df_cache: Dict[str, "pd.DataFrame"] = {}
+    _sheets_cache: Dict[str, Dict[str, "pd.DataFrame"]] = {}
+
+    def _get_obj_df(path: str) -> "pd.DataFrame":
+        if path not in _df_cache:
+            _df_cache[path] = _read_excel_object_dataframe(path)
+        return _df_cache[path]
+
+    def _get_sheets(path: str) -> Dict[str, "pd.DataFrame"]:
+        if path not in _sheets_cache:
+            _sheets_cache[path] = _read_excel_sheets_object_frames(path)
+        return _sheets_cache[path]
+
     seen: set[Tuple[str, str]] = set()
     errors: List[str] = []
-    successful_candidates: List[Tuple[float, str, str, MappingBundle]] = []
+    successful_candidates: List[Tuple[float, str, str, MappingBundle, "pd.DataFrame"]] = []
     for text_path, value_path in candidates:
         key = (text_path, value_path)
         if key in seen:
             continue
         seen.add(key)
         try:
-            bundle = _load_mapping_bundle(text_path, value_path)
+            text_df = _get_obj_df(text_path)
+            value_sheets = _get_sheets(value_path)
+            value_df = next(iter(value_sheets.values()))
+            bundle = _load_mapping_bundle(text_path, value_path,
+                                          _preread_text_df=text_df,
+                                          _preread_value_sheets=value_sheets)
             if bundle.source_kind == "codebook":
-                return text_path, value_path, bundle
-            text_df = _read_excel_object_dataframe(text_path)
-            value_df = _read_excel_object_dataframe(value_path)
+                return text_path, value_path, bundle, value_df
             _validate_mapping_frames(text_df, value_df)
             successful_candidates.append(
-                (_orientation_confidence(text_df, value_df), text_path, value_path, bundle)
+                (_orientation_confidence(text_df, value_df), text_path, value_path, bundle, value_df)
             )
         except Exception as e:
             errors.append(f"text={os.path.basename(text_path)}, value={os.path.basename(value_path)} -> {e}")
 
     if successful_candidates:
         successful_candidates.sort(key=lambda item: item[0], reverse=True)
-        return successful_candidates[0][1], successful_candidates[0][2], successful_candidates[0][3]
+        _, text_path, value_path, bundle, value_df = successful_candidates[0]
+        return text_path, value_path, bundle, value_df
 
     joined = " | ".join(errors) if errors else "no compatible workbook pairing found"
     raise RuntimeError(f"Failed to identify text workbook and Value.xlsx automatically: {joined}")
@@ -1330,15 +1352,23 @@ def _mapped_series(
     codes = [_normalize_response_value(v) for v in df[question].tolist()]
     _validate_question_codes(question, mapping, codes)
 
-    rows: List[Dict[str, Any]] = []
-    for code in codes:
-        if code is None:
-            continue
-        cat = mapping.by_code[code]
-        rows.append({"code": cat.raw_code, "label": cat.label, "order": cat.order})
-
-    frame = pd.DataFrame(rows, columns=["code", "label", "order"])  # type: ignore[union-attr]
-    present_codes = {r["code"] for r in rows}
+    codes_s = pd.Series(codes, dtype=object)
+    valid = codes_s.dropna()
+    by_code = mapping.by_code
+    if valid.empty:
+        frame = pd.DataFrame(columns=["code", "label", "order"])  # type: ignore[union-attr]
+        present_codes: set = set()
+    else:
+        unique_vals = [c for c in valid.unique() if c in by_code]
+        raw_code_lookup = {c: by_code[c].raw_code for c in unique_vals}
+        label_lookup = {c: by_code[c].label for c in unique_vals}
+        order_lookup = {c: by_code[c].order for c in unique_vals}
+        frame = pd.DataFrame({  # type: ignore[union-attr]
+            "code": valid.map(raw_code_lookup),
+            "label": valid.map(label_lookup),
+            "order": valid.map(order_lookup),
+        }).reset_index(drop=True)
+        present_codes = set(raw_code_lookup.values())
     categories = list(mapping.categories) if include_all_categories else [
         cat for cat in mapping.categories if cat.raw_code in present_codes
     ]
@@ -1364,13 +1394,12 @@ def _composite_codes_for_questions(
 ) -> List[Optional[str]]:
     codes1, _ = _mapped_codes_for_question(df, bundle, question1)
     codes2, _ = _mapped_codes_for_question(df, bundle, question2)
-    composite_codes: List[Optional[str]] = []
-    for code1, code2 in zip(codes1, codes2):
-        if code1 is None or code2 is None:
-            composite_codes.append(None)
-        else:
-            composite_codes.append(f"{code1} | {code2}")
-    return composite_codes
+    s1 = pd.Series(codes1, dtype=object)  # type: ignore[union-attr]
+    s2 = pd.Series(codes2, dtype=object)  # type: ignore[union-attr]
+    both_valid = s1.notna() & s2.notna()
+    result = pd.Series([None] * len(s1), dtype=object)  # type: ignore[union-attr]
+    result[both_valid] = s1[both_valid] + " | " + s2[both_valid]
+    return result.tolist()
 
 
 def _mapped_composite_series(
@@ -2089,12 +2118,8 @@ def tabulate_sr(
         col_codes, _ = _mapped_codes_for_question(df, bundle, col_var)
     else:
         col_codes = _composite_codes_for_questions(df, bundle, col_var, col_var2)
-    rows: List[Dict[str, Any]] = []
-    for row_code, col_code, weight in zip(row_codes, col_codes, weights):
-        if row_code is None or col_code is None or weight == 0:
-            continue
-        rows.append({"row_code": row_code, "col_code": col_code, "count": weight})
-    counts = pd.DataFrame(rows, columns=["row_code", "col_code", "count"])  # type: ignore[union-attr]
+    counts = pd.DataFrame({"row_code": row_codes, "col_code": col_codes, "count": weights})  # type: ignore[union-attr]
+    counts = counts[counts["row_code"].notna() & counts["col_code"].notna() & (counts["count"] != 0)]
     if not counts.empty:
         counts = counts.groupby(["row_code", "col_code"], dropna=False)["count"].sum().reset_index()
     tables = _format_ordered_tables(
@@ -2165,7 +2190,6 @@ def tabulate_mr(
     mr_row_label, row_categories, column_to_category = _build_mr_row_categories(bundle, mr_cols, mr_detection)
     allowed = {"1", "true", "yes", "y", "t"}
     valid_dichotomy = {"0", "1", "true", "false", "yes", "no", "y", "n", "t", "f"}
-    rows: List[Dict[str, Any]] = []
     selected_by_question: Dict[str, List[Optional[str]]] = {}
     for question in mr_cols:
         selected_codes = [_normalize_response_value(v) for v in df[question].tolist()]
@@ -2175,36 +2199,46 @@ def tabulate_mr(
         if invalid:
             shown = ", ".join(invalid[:10])
             raise RuntimeError(f"MR column '{question}' contains non-dichotomy values: {shown}")
-        row_category = column_to_category[question]
-        for selected, col_code, weight in zip(selected_codes, col_codes, weights):
-            if selected is None or selected.lower() not in allowed or col_code is None or weight == 0:
-                continue
-            rows.append({"row_code": row_category.raw_code, "col_code": col_code, "count": weight})
 
-    respondent_base_rows: List[Tuple[str, float]] = []
     respondent_count = min(
         [len(col_codes), len(weights)] + [len(codes) for codes in selected_by_question.values()]
     ) if selected_by_question else 0
-    for idx in range(respondent_count):
-        answered = any(
-            selected_by_question[question][idx] is not None and selected_by_question[question][idx].lower() in allowed
-            for question in mr_cols
-        )
-        if not answered:
-            continue
-        col_code = col_codes[idx]
-        weight = weights[idx]
-        if col_code is None or weight == 0:
-            continue
-        respondent_base_rows.append((str(col_code), weight))
-    base_col_totals: Dict[str, float] = {str(cat.raw_code): 0.0 for cat in col_categories}
-    for code, weight in respondent_base_rows:
-        base_col_totals[code] = base_col_totals.get(code, 0) + weight
-    base_grand_total = sum(weight for _, weight in respondent_base_rows)
+    col_codes_s = pd.Series(col_codes[:respondent_count], dtype=object)  # type: ignore[union-attr]
+    weights_s = pd.Series(weights[:respondent_count], dtype=float)  # type: ignore[union-attr]
+    valid_col = col_codes_s.notna() & (weights_s != 0)
 
-    counts = pd.DataFrame(rows, columns=["row_code", "col_code", "count"])  # type: ignore[union-attr]
+    # Boolean matrix: shape (n_respondents, n_mr_cols), True where respondent selected
+    selected_matrix = pd.DataFrame({  # type: ignore[union-attr]
+        q: pd.Series(selected_by_question[q][:respondent_count], dtype=object).isin(allowed)  # type: ignore[union-attr]
+        for q in mr_cols
+    })
+
+    # Tabulation counts: per-question boolean mask replaces inner loop
+    all_row_codes: List[str] = []
+    all_col_codes_out: List[str] = []
+    all_weights_out: List[float] = []
+    for question in mr_cols:
+        row_category = column_to_category[question]
+        mask = selected_matrix[question] & valid_col
+        n = int(mask.sum())
+        if n:
+            all_row_codes.extend([row_category.raw_code] * n)
+            all_col_codes_out.extend(col_codes_s[mask].tolist())
+            all_weights_out.extend(weights_s[mask].tolist())
+
+    counts = pd.DataFrame({"row_code": all_row_codes, "col_code": all_col_codes_out, "count": all_weights_out})  # type: ignore[union-attr]
     if not counts.empty:
         counts = counts.groupby(["row_code", "col_code"], dropna=False)["count"].sum().reset_index()
+
+    # Respondent base: vectorized any-selected check replaces per-respondent loop
+    answered_mask = selected_matrix.any(axis=1) & valid_col
+    base_col_totals: Dict[str, float] = {str(cat.raw_code): 0.0 for cat in col_categories}
+    if answered_mask.any():
+        base_grouped = weights_s[answered_mask].groupby(col_codes_s[answered_mask]).sum()
+        for code, w in base_grouped.items():
+            base_col_totals[str(code)] = base_col_totals.get(str(code), 0.0) + float(w)
+    base_grand_total = float(weights_s[answered_mask].sum()) if answered_mask.any() else 0.0
+
     resolved_custom_groups: List[Dict[str, Any]] = []
     custom_group_count_overrides: Dict[str, Dict[str, float]] = {}
     for group in list(custom_groups or []):
@@ -2226,18 +2260,12 @@ def tabulate_mr(
                 question for question, category in column_to_category.items()
                 if category.raw_code in set(resolved_codes)
             ]
-            for idx in range(respondent_count):
-                matched = any(
-                    selected_by_question[question][idx] is not None and selected_by_question[question][idx].lower() in allowed
-                    for question in included_questions
-                )
-                if not matched:
-                    continue
-                col_code = col_codes[idx]
-                weight = weights[idx]
-                if col_code is None or weight == 0:
-                    continue
-                grouped_counts[str(col_code)] = grouped_counts.get(str(col_code), 0) + weight
+            if included_questions:
+                group_mask = selected_matrix[included_questions].any(axis=1) & valid_col
+                if group_mask.any():
+                    group_grouped = weights_s[group_mask].groupby(col_codes_s[group_mask]).sum()
+                    for code, w in group_grouped.items():
+                        grouped_counts[str(code)] = grouped_counts.get(str(code), 0.0) + float(w)
             custom_group_count_overrides[group_label] = grouped_counts
     tables = _format_ordered_tables(
         counts,
@@ -2334,7 +2362,7 @@ async def upload(
         f.write(raw_value_file)
 
     try:
-        text_path, value_path, mapping_bundle = _resolve_uploaded_workbook_roles(
+        text_path, value_path, mapping_bundle, preloaded_value_df = _resolve_uploaded_workbook_roles(
             save_path_a,
             file.filename,
             save_path_b,
@@ -2364,7 +2392,7 @@ async def upload(
         "name": os.path.basename(text_path),
         "path": text_path,
         "value_path": value_path,
-        "value_df": None,
+        "value_df": preloaded_value_df,
         "mapping_bundle": mapping_bundle,
         "groupable_question_options": _groupable_question_options(mapping_bundle),
         "columns": columns,

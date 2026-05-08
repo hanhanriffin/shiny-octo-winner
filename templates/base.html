@@ -53,9 +53,20 @@
         if (mode === "upload") {
           const xhr = new XMLHttpRequest();
           let stopProcessingProgress = null;
+          let _uploadStart = null;
+          let _uploadTick = null;
+          const _elapsedEl = document.querySelector("[data-upload-elapsed]");
+          const _stopUploadTimer = () => { if (_uploadTick) { window.clearInterval(_uploadTick); _uploadTick = null; } };
           xhr.open("POST", url, true);
           xhr.setRequestHeader("X-Requested-With", "XMLHttpRequest");
           xhr.onloadstart = () => {
+            _uploadStart = performance.now();
+            if (_elapsedEl) {
+              _elapsedEl.textContent = "0.0s";
+              _uploadTick = window.setInterval(() => {
+                _elapsedEl.textContent = ((performance.now() - _uploadStart) / 1000).toFixed(1) + "s";
+              }, 100);
+            }
             document.dispatchEvent(new CustomEvent("crosstab:progress-start", {
               detail: {
                 form,
@@ -102,6 +113,8 @@
             });
           };
           xhr.onload = () => {
+            _stopUploadTimer();
+            const _elapsed = _uploadStart !== null ? ((performance.now() - _uploadStart) / 1000).toFixed(1) : null;
             if (typeof stopProcessingProgress === "function") {
               stopProcessingProgress();
             }
@@ -109,6 +122,10 @@
               injectResponse(targetSelector, swapMode, xhr.responseText);
               const resultArea = document.querySelector("#result_area");
               if (resultArea) resultArea.innerHTML = "";
+              if (_elapsed !== null) {
+                const summaryEl = document.querySelector("[data-upload-selection-summary]");
+                if (summaryEl) summaryEl.textContent = `Dataset loaded in ${_elapsed}s`;
+              }
               document.dispatchEvent(new CustomEvent("crosstab:fallback-complete", { detail: { form } }));
             } else {
               injectResponse(targetSelector, swapMode, `<div class="card"><p>${xhr.responseText || "Upload failed."}</p></div>`);
@@ -116,6 +133,7 @@
             }
           };
           xhr.onerror = () => {
+            _stopUploadTimer();
             if (typeof stopProcessingProgress === "function") {
               stopProcessingProgress();
             }
