@@ -1,6 +1,0 @@
-INFO:     Started server process [25408]
-INFO:     Waiting for application startup.
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://127.0.0.1:8001 (Press CTRL+C to quit)
-Could not determine dtype for column 35, falling back to string
-Could not determine dtype for column 35, falling back to string
