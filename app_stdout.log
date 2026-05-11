@@ -1,0 +1,5 @@
+ * Serving Flask app 'app'
+ * Debug mode: off
+[mem] startup | RSS 136.6 MB | jobs in-mem 0 | job-dirs on-disk 5
+[mem] upload job=c6ab8e53 | RSS 240.2 MB | jobs in-mem 1 | job-dirs on-disk 6
+[mem] upload job=2aaef0a4 | RSS 272.7 MB | jobs in-mem 2 | job-dirs on-disk 7
