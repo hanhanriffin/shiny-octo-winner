@@ -1,0 +1,3 @@
+[mem] startup | RSS 124.3 MB | jobs in-mem 0 | job-dirs on-disk 20
+[mem] upload job=dba69a47 | RSS 227.1 MB | jobs in-mem 1 | job-dirs on-disk 21
+[mem] run job=dba69a47 | RSS 218.7 MB | jobs in-mem 1 | job-dirs on-disk 21

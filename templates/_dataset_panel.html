@@ -21,9 +21,7 @@
   <form class="workspace-form"
         method="post"
         action="/run"
-        hx-post="/run"
         hx-target="#result_area"
-        hx-swap="innerHTML"
         data-progress-form="run"
         data-ajax-submit="run">
     <input type="hidden" name="job_id" value="{{ job.id }}" />
@@ -367,7 +365,7 @@
 
 <script>
 (() => {
-  const forms = document.querySelectorAll('form[hx-post="/run"]');
+  const forms = document.querySelectorAll('form[data-ajax-submit="run"]');
   const form = forms[forms.length - 1];
   if (!form) return;
   const prefsKey = "crosstab_run_preferences_v1";

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 import os
 import io
+import sys
 import json
 import re
 import shutil
@@ -14,6 +16,50 @@ from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    import psutil as _psutil
+    _psutil_available = True
+except Exception:
+    _psutil = None  # type: ignore
+    _psutil_available = False
+
+logger = logging.getLogger("crosstab")
+
+
+def _mem_rss_mb() -> float:
+    if _psutil_available:
+        try:
+            return _psutil.Process().memory_info().rss / 1024 / 1024
+        except Exception:
+            pass
+    try:
+        with open("/proc/self/status") as _f:
+            for _line in _f:
+                if _line.startswith("VmRSS:"):
+                    return int(_line.split()[1]) / 1024
+    except Exception:
+        pass
+    return 0.0
+
+
+_LOG_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "crosstab_mem.log")
+
+
+def _log_memory(label: str) -> None:
+    rss = _mem_rss_mb()
+    jobs_in_mem = len(JOBS)
+    dirs_on_disk = sum(1 for e in os.scandir(UPLOAD_DIR) if e.is_dir()) if os.path.isdir(UPLOAD_DIR) else 0
+    msg = f"[mem] {label} | RSS {rss:.1f} MB | jobs in-mem {jobs_in_mem} | job-dirs on-disk {dirs_on_disk}"
+    logger.info(msg)
+    print(msg, flush=True)
+    print(msg, file=sys.stderr, flush=True)
+    try:
+        with open(_LOG_FILE, "a", encoding="utf-8") as _lf:
+            _lf.write(msg + "\n")
+            _lf.flush()
+    except Exception:
+        pass
 
 import polars as pl
 from fastapi import FastAPI, Form, Request, UploadFile, File, HTTPException
@@ -33,7 +79,8 @@ except Exception:
 APP_TITLE = "Simple Crosstab Application"
 APP_VERSION = "v8.0"
 JOB_STATE_FILENAME = "job_state.json"
-DEFAULT_JOB_TTL_SECONDS = 60 * 60 * 24
+DEFAULT_JOB_TTL_SECONDS = 60 * 60 * 2  # 2 hours
+MAX_JOBS_IN_MEMORY = int(os.environ.get("CROSSTAB_MAX_JOBS_IN_MEMORY", "8"))
 
 
 def _default_upload_dir() -> str:
@@ -45,9 +92,19 @@ JOB_TTL_SECONDS = max(0, int(os.environ.get("CROSSTAB_JOB_TTL_SECONDS", str(DEFA
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = FastAPI(title=APP_TITLE)
+print(f"[crosstab] main.py loaded — TTL={JOB_TTL_SECONDS}s max_mem={MAX_JOBS_IN_MEMORY}", file=sys.stderr, flush=True)
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))  # project root (Crosstab)
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
+
+
+@app.on_event("startup")
+def _startup_cleanup() -> None:
+    print("[crosstab] startup event fired", file=sys.stderr, flush=True)
+    removed = _cleanup_stale_job_dirs()
+    if removed:
+        print(f"[mem] startup cleanup removed {len(removed)} stale job(s): {removed}", file=sys.stderr, flush=True)
+    _log_memory("startup")
 
 
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -61,6 +118,13 @@ def favicon():
 
 
 JOBS: Dict[str, Dict[str, Any]] = {}
+
+
+def _evict_jobs_if_needed() -> None:
+    while len(JOBS) >= MAX_JOBS_IN_MEMORY:
+        evicted = next(iter(JOBS))
+        JOBS.pop(evicted)
+        print(f"[mem] evicted job {evicted[:8]}... from memory (cap={MAX_JOBS_IN_MEMORY})", file=sys.stderr, flush=True)
 
 YES_WORDS = {"yes", "y", "true", "t"}
 NO_WORDS = {"no", "n", "false", "f"}
@@ -264,6 +328,7 @@ def _get_job(job_id: str) -> Optional[Dict[str, Any]]:
         return job
     restored = _restore_job_from_disk(normalized)
     if restored is not None:
+        _evict_jobs_if_needed()
         JOBS[normalized] = restored
     return restored
 
@@ -302,6 +367,7 @@ def _cleanup_stale_job_dirs(
             shutil.rmtree(candidate)
             removed.append(os.path.basename(candidate))
             JOBS.pop(os.path.basename(candidate), None)
+            print(f"[mem] removed stale job dir {os.path.basename(candidate)[:8]}... (age {age_seconds/3600:.1f}h)", file=sys.stderr, flush=True)
         except OSError:
             continue
     return removed
@@ -2406,8 +2472,10 @@ async def upload(
         "last_saved_message": None,
         "saved_modal_open": False,
     }
+    _evict_jobs_if_needed()
     JOBS[job_id] = job
     _persist_job_state(job)
+    _log_memory(f"upload job={job_id[:8]}")
 
     if _is_partial_request(request):
         return templates.TemplateResponse(
@@ -2447,6 +2515,7 @@ def run(
     include_base: str | None = Form(None),
     include_totals: str | None = Form(None),
 ):
+    _log_memory(f"run job={job_id[:8]}")
     job = _get_job(job_id)
     if job is None:
         return _render_error_panel("Invalid job id.")
