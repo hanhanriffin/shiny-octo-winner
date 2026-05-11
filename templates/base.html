@@ -230,6 +230,13 @@
       document.addEventListener("crosstab:activate-inline-scripts", (event) => {
         activateInlineScripts(event.detail && event.detail.root ? event.detail.root : document);
       });
+
+      document.addEventListener("htmx:beforeRequest", (event) => {
+        const elt = event.detail && event.detail.elt;
+        if (elt && elt.getAttribute && elt.getAttribute("data-ajax-submit")) {
+          event.preventDefault();
+        }
+      });
     })();
   </script>
   <script>

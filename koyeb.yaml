@@ -17,7 +17,9 @@ services:
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: CROSSTAB_JOB_TTL_SECONDS
-        value: "86400"
+        value: "7200"
+      - key: CROSSTAB_MAX_JOBS_IN_MEMORY
+        value: "3"
     health_check:
       http:
         path: /health/deploy-smoke
