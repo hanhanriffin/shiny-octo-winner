@@ -104,6 +104,22 @@ def _startup_cleanup() -> None:
     removed = _cleanup_stale_job_dirs()
     if removed:
         print(f"[mem] startup cleanup removed {len(removed)} stale job(s): {removed}", file=sys.stderr, flush=True)
+
+
+_last_cleanup_time: float = 0.0
+_CLEANUP_INTERVAL_SECONDS = 300  # run at most once every 5 minutes
+
+
+@app.middleware("http")
+async def periodic_cleanup_middleware(request, call_next):
+    global _last_cleanup_time
+    now = time.time()
+    if now - _last_cleanup_time >= _CLEANUP_INTERVAL_SECONDS:
+        _last_cleanup_time = now
+        removed = _cleanup_stale_job_dirs()
+        if removed:
+            print(f"[mem] periodic cleanup removed {len(removed)} stale job(s): {removed}", file=sys.stderr, flush=True)
+    return await call_next(request)
     _log_memory("startup")
 
 
