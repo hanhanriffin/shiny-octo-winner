@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+import gc
 import logging
 import os
 import io
@@ -58,6 +60,14 @@ def _log_memory(label: str) -> None:
         with open(_LOG_FILE, "a", encoding="utf-8") as _lf:
             _lf.write(msg + "\n")
             _lf.flush()
+    except Exception:
+        pass
+
+
+def _release_memory() -> None:
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception:
         pass
 
@@ -137,10 +147,14 @@ JOBS: Dict[str, Dict[str, Any]] = {}
 
 
 def _evict_jobs_if_needed() -> None:
+    evicted_any = False
     while len(JOBS) >= MAX_JOBS_IN_MEMORY:
         evicted = next(iter(JOBS))
         JOBS.pop(evicted)
+        evicted_any = True
         print(f"[mem] evicted job {evicted[:8]}... from memory (cap={MAX_JOBS_IN_MEMORY})", file=sys.stderr, flush=True)
+    if evicted_any:
+        _release_memory()
 
 YES_WORDS = {"yes", "y", "true", "t"}
 NO_WORDS = {"no", "n", "false", "f"}
@@ -386,6 +400,8 @@ def _cleanup_stale_job_dirs(
             print(f"[mem] removed stale job dir {os.path.basename(candidate)[:8]}... (age {age_seconds/3600:.1f}h)", file=sys.stderr, flush=True)
         except OSError:
             continue
+    if removed:
+        _release_memory()
     return removed
 
 
