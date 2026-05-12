@@ -89,7 +89,7 @@ except Exception:
 APP_TITLE = "Simple Crosstab Application"
 APP_VERSION = "v8.0"
 JOB_STATE_FILENAME = "job_state.json"
-DEFAULT_JOB_TTL_SECONDS = 60 * 60 * 2  # 2 hours
+DEFAULT_JOB_TTL_SECONDS = 60 * 10  # 10 minutes
 MAX_JOBS_IN_MEMORY = int(os.environ.get("CROSSTAB_MAX_JOBS_IN_MEMORY", "8"))
 
 
